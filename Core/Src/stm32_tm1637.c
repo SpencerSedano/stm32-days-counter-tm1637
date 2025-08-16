@@ -7,6 +7,7 @@ void _tm1637Stop(void);
 void _tm1637ReadResult(void);
 void _tm1637WriteByte(unsigned char b);
 void _tm1637DelayUsec(unsigned int i);
+//static inline void _tm1637DelayUsec(uint32_t us);
 void _tm1637ClkHigh(void);
 void _tm1637ClkLow(void);
 void _tm1637DioHigh(void);
@@ -145,6 +146,12 @@ void _tm1637DelayUsec(unsigned int i)
         }
     }
 }
+//static inline void _tm1637DelayUsec(uint32_t us)
+//{
+//    uint32_t start = DWT->CYCCNT;
+//    uint32_t ticks = (SystemCoreClock / 1000000U) * us;
+//    while ((DWT->CYCCNT - start) < ticks) { /* spin */ }
+//}
 
 void _tm1637ClkHigh(void)
 {

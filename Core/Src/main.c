@@ -20,6 +20,7 @@
 #include "main.h"
 #include "stm32_tm1637.h"
 
+
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 
@@ -41,6 +42,8 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+RTC_HandleTypeDef hrtc;
+
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
@@ -51,7 +54,9 @@ UART_HandleTypeDef huart2;
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_USART2_UART_Init(void);
+static void MX_RTC_Init(void);
 /* USER CODE BEGIN PFP */
+static int getDaysSinceStart(void);
 
 /* USER CODE END PFP */
 
@@ -77,7 +82,10 @@ int main(void)
   HAL_Init();
 
   /* USER CODE BEGIN Init */
-
+  /* Force RTC reset - add this line in USER CODE BEGIN 2, BEFORE MX_RTC_Init() call */
+  HAL_PWR_EnableBkUpAccess();
+  HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_DR0, 0x0000);  // Clear backup register
+  HAL_PWR_DisableBkUpAccess();
   /* USER CODE END Init */
 
   /* Configure the system clock */
@@ -90,12 +98,32 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_USART2_UART_Init();
+  MX_RTC_Init();
   /* USER CODE BEGIN 2 */
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT->CYCCNT = 0;
+  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+
+  /* ALWAYS set RTC to our desired date - ignore backup register */
+  HAL_PWR_EnableBkUpAccess();
+  RTC_DateTypeDef sDate = {0};
+  RTC_TimeTypeDef sTime = {0};
+
+  /* Set to current date: Aug 16, 2025 */
+  sDate.Year  = 25;                       /* 2025 */
+  sDate.Month = RTC_MONTH_AUGUST;         /* August */
+  sDate.Date  = 16;                       /* 16th */
+  sDate.WeekDay = RTC_WEEKDAY_SATURDAY;   /* Saturday */
+  HAL_RTC_SetDate(&hrtc, &sDate, RTC_FORMAT_BIN);
+
+  sTime.Hours = 12; sTime.Minutes = 0; sTime.Seconds = 0;
+  HAL_RTC_SetTime(&hrtc, &sTime, RTC_FORMAT_BIN);
+
+  HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_DR0, 0xA5A5);  /* mark as initialized */
+  HAL_PWR_DisableBkUpAccess();
+
   tm1637Init();
-  // Optionally set brightness. 0 is off. By default, initialized to full brightness.
   tm1637SetBrightness(3);
-  // Display the value "1234" and turn on the `:` that is between digits 2 and 3.
-  tm1637DisplayDecimal(1234, 0);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -105,6 +133,12 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+	  static int t = 0;
+	  int days = getDaysSinceStart();
+	  /* show last 4 digits on TM1637 */
+	  tm1637DisplayDecimal(days % 10000, 0);
+	  t++;
+	  HAL_Delay(500);
   }
   /* USER CODE END 3 */
 }
@@ -126,7 +160,8 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI|RCC_OSCILLATORTYPE_LSE;
+  RCC_OscInitStruct.LSEState = RCC_LSE_ON;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
   RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
@@ -154,6 +189,76 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+}
+
+/**
+  * @brief RTC Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_RTC_Init(void)
+{
+
+  /* USER CODE BEGIN RTC_Init 0 */
+
+  /* USER CODE END RTC_Init 0 */
+
+  RTC_TimeTypeDef sTime = {0};
+  RTC_DateTypeDef sDate = {0};
+
+  /* USER CODE BEGIN RTC_Init 1 */
+
+  /* USER CODE END RTC_Init 1 */
+
+  /** Initialize RTC Only
+  */
+  hrtc.Instance = RTC;
+  hrtc.Init.HourFormat = RTC_HOURFORMAT_24;
+  hrtc.Init.AsynchPrediv = 127;
+  hrtc.Init.SynchPrediv = 255;
+  hrtc.Init.OutPut = RTC_OUTPUT_DISABLE;
+  hrtc.Init.OutPutPolarity = RTC_OUTPUT_POLARITY_HIGH;
+  hrtc.Init.OutPutType = RTC_OUTPUT_TYPE_OPENDRAIN;
+  if (HAL_RTC_Init(&hrtc) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+//  /* USER CODE BEGIN Check_RTC_BKUP */
+  HAL_PWR_EnableBkUpAccess();
+  /* If RTC already configured before, skip the default SetTime/SetDate below */
+  if (HAL_RTCEx_BKUPRead(&hrtc, RTC_BKP_DR0) == 0xA5A5) {
+    HAL_PWR_DisableBkUpAccess();
+    return;  /* <-- do not touch the comments above/below, just early-return */
+  }
+  HAL_PWR_DisableBkUpAccess();
+
+  /* USER CODE END Check_RTC_BKUP */
+
+  /** Initialize RTC and set the Time and Date
+  */
+  sTime.Hours = 0x0;
+  sTime.Minutes = 0x0;
+  sTime.Seconds = 0x0;
+  sTime.DayLightSaving = RTC_DAYLIGHTSAVING_NONE;
+  sTime.StoreOperation = RTC_STOREOPERATION_RESET;
+  if (HAL_RTC_SetTime(&hrtc, &sTime, RTC_FORMAT_BCD) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sDate.WeekDay = RTC_WEEKDAY_MONDAY;
+  sDate.Month = RTC_MONTH_JANUARY;
+  sDate.Date = 0x1;
+  sDate.Year = 0x0;
+
+  if (HAL_RTC_SetDate(&hrtc, &sDate, RTC_FORMAT_BCD) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN RTC_Init 2 */
+
+  /* USER CODE END RTC_Init 2 */
+
 }
 
 /**
@@ -221,9 +326,9 @@ static void MX_GPIO_Init(void)
 
   /*Configure GPIO pins : CLK_Pin DIO_Pin */
   GPIO_InitStruct.Pin = CLK_Pin|DIO_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
   /*Configure GPIO pin : LD2_Pin */
@@ -239,6 +344,23 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+static int daysFromCivil(int y, unsigned m, unsigned d) {
+  y -= m <= 2;
+  int era = (y >= 0 ? y : y - 399) / 400;
+  unsigned yoe = (unsigned)(y - era * 400);
+  unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097 + (int)doe - 1;
+}
+
+static int getDaysSinceStart(void) {
+  RTC_DateTypeDef nowD; RTC_TimeTypeDef nowT;
+  HAL_RTC_GetTime(&hrtc, &nowT, RTC_FORMAT_BIN);
+  HAL_RTC_GetDate(&hrtc, &nowD, RTC_FORMAT_BIN);
+  int start = daysFromCivil(2023, 1, 10);
+  int now   = daysFromCivil(2000 + nowD.Year, nowD.Month, nowD.Date);
+  return now - start;
+}
 
 /* USER CODE END 4 */
 

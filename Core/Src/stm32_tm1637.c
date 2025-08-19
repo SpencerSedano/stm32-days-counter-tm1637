@@ -1,174 +1,128 @@
 #include "stm32f4xx_hal.h"
 #include "stm32_tm1637.h"
 
+/* === Pin mapping: PC0 = CLK, PC1 = DIO === */
+#define TM_CLK_PORT GPIOC
+#define TM_DIO_PORT GPIOC
+#define TM_CLK_PIN  GPIO_PIN_0
+#define TM_DIO_PIN  GPIO_PIN_1
+#define TM_CLK_EN() __HAL_RCC_GPIOC_CLK_ENABLE()
+#define TM_DIO_EN() __HAL_RCC_GPIOC_CLK_ENABLE()
 
-void _tm1637Start(void);
-void _tm1637Stop(void);
-void _tm1637ReadResult(void);
-void _tm1637WriteByte(unsigned char b);
-void _tm1637DelayUsec(unsigned int i);
-//static inline void _tm1637DelayUsec(uint32_t us);
-void _tm1637ClkHigh(void);
-void _tm1637ClkLow(void);
-void _tm1637DioHigh(void);
-void _tm1637DioLow(void);
-
-// Configuration.
-
-//name of PIN: CLK and DIO. Modify it accordingly.
-//using PIN 0 and 1
-
-#define CLK_PORT GPIOC
-#define DIO_PORT GPIOC
-#define CLK_PIN GPIO_PIN_0
-#define DIO_PIN GPIO_PIN_1
-#define CLK_PORT_CLK_ENABLE __HAL_RCC_GPIOC_CLK_ENABLE
-#define DIO_PORT_CLK_ENABLE __HAL_RCC_GPIOC_CLK_ENABLE
-
-
-const char segmentMap[] = {
-    0x3f, 0x06, 0x5b, 0x4f, 0x66, 0x6d, 0x7d, 0x07, // 0-7
-    0x7f, 0x6f, 0x77, 0x7c, 0x39, 0x5e, 0x79, 0x71, // 8-9, A-F
-    0x00
+/* 7-seg map */
+static const uint8_t SEG[] = {
+  0x3f,0x06,0x5b,0x4f,0x66,0x6d,0x7d,0x07,  // 0..7
+  0x7f,0x6f,0x77,0x7c,0x39,0x5e,0x79,0x71,  // 8..9, A..F
+  0x00                                       // blank
 };
 
-
-void tm1637Init(void)
-{
-    CLK_PORT_CLK_ENABLE();
-    DIO_PORT_CLK_ENABLE();
-    GPIO_InitTypeDef g = {0};
-    g.Pull = GPIO_PULLUP;
-    g.Mode = GPIO_MODE_OUTPUT_OD; // OD = open drain
-    g.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
-    g.Pin = CLK_PIN;
-    HAL_GPIO_Init(CLK_PORT, &g);
-    g.Pin = DIO_PIN;
-    HAL_GPIO_Init(DIO_PORT, &g);
-
-    tm1637SetBrightness(8);
+/* --- tiny µs delay (tolerant enough for TM1637) --- */
+static void dly_us(unsigned us){
+  for(; us>0; --us){
+    for(volatile int i=0;i<12;i++){ __asm__ __volatile__("nop"); }
+  }
 }
 
-void tm1637DisplayDecimal(int v, int displaySeparator)
-{
-    unsigned char digitArr[4];
-    for (int i = 0; i < 4; ++i) {
-        digitArr[i] = segmentMap[v % 10];
-        if (i == 2 && displaySeparator) {
-            digitArr[i] |= 1 << 7;
-        }
-        v /= 10;
-    }
+/* --- GPIO helpers --- */
+static inline void CLK_H(void){ HAL_GPIO_WritePin(TM_CLK_PORT, TM_CLK_PIN, GPIO_PIN_SET); }
+static inline void CLK_L(void){ HAL_GPIO_WritePin(TM_CLK_PORT, TM_CLK_PIN, GPIO_PIN_RESET); }
+static inline void DIO_H(void){ HAL_GPIO_WritePin(TM_DIO_PORT, TM_DIO_PIN, GPIO_PIN_SET); }
+static inline void DIO_L(void){ HAL_GPIO_WritePin(TM_DIO_PORT, TM_DIO_PIN, GPIO_PIN_RESET); }
 
-    _tm1637Start();
-    _tm1637WriteByte(0x40);
-    _tm1637ReadResult();
-    _tm1637Stop();
-
-    _tm1637Start();
-    _tm1637WriteByte(0xc0);
-    _tm1637ReadResult();
-
-    for (int i = 0; i < 4; ++i) {
-        _tm1637WriteByte(digitArr[3 - i]);
-        _tm1637ReadResult();
-    }
-
-    _tm1637Stop();
+static void DIO_to_in(void){
+  GPIO_InitTypeDef g={0};
+  g.Pin   = TM_DIO_PIN;
+  g.Mode  = GPIO_MODE_INPUT;
+  g.Pull  = GPIO_NOPULL;                 // rely on module pull-ups
+  g.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  HAL_GPIO_Init(TM_DIO_PORT, &g);
+}
+static void DIO_to_outOD(void){
+  GPIO_InitTypeDef g={0};
+  g.Pin   = TM_DIO_PIN;
+  g.Mode  = GPIO_MODE_OUTPUT_OD;
+  g.Pull  = GPIO_NOPULL;                 // IMPORTANT at 5V
+  g.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  HAL_GPIO_Init(TM_DIO_PORT, &g);
 }
 
-// Valid brightness values: 0 - 8.
-// 0 = display off.
-void tm1637SetBrightness(char brightness)
-{
-    // Brightness command:
-    // 1000 0XXX = display off
-    // 1000 1BBB = display on, brightness 0-7
-    // X = don't care
-    // B = brightness
-    _tm1637Start();
-    _tm1637WriteByte(0x87 + brightness);
-    _tm1637ReadResult();
-    _tm1637Stop();
+/* --- bus primitives --- */
+static void start(void){
+  CLK_H(); DIO_H(); dly_us(3);
+  DIO_L();          dly_us(3);
+  CLK_L();          dly_us(3);
+}
+static void stop_(void){
+  CLK_L(); DIO_L(); dly_us(3);
+  CLK_H();          dly_us(3);
+  DIO_H();          dly_us(3);
+}
+static uint8_t readAck(void){
+  uint8_t ack;
+  CLK_L();
+  DIO_to_in(); DIO_H(); dly_us(3);      // release line
+  CLK_H(); dly_us(3);
+  ack = (uint8_t)HAL_GPIO_ReadPin(TM_DIO_PORT, TM_DIO_PIN); // 0 = ACK
+  CLK_L();
+  DIO_to_outOD();
+  return ack;
+}
+static void writeByte(uint8_t b){
+  for(int i=0;i<8;i++){
+    CLK_L();
+    (b & 0x01) ? DIO_H() : DIO_L();
+    dly_us(3);
+    CLK_H(); dly_us(3);
+    b >>= 1;
+  }
+  (void)readAck();
 }
 
-void _tm1637Start(void)
-{
-    _tm1637ClkHigh();
-    _tm1637DioHigh();
-    _tm1637DelayUsec(2);
-    _tm1637DioLow();
+/* --- API --- */
+void tm1637Init(void){
+  TM_CLK_EN(); TM_DIO_EN();
+
+  /* idle high */
+  CLK_H(); DIO_H();
+
+  GPIO_InitTypeDef g={0};
+  g.Pin   = TM_CLK_PIN;
+  g.Mode  = GPIO_MODE_OUTPUT_OD;
+  g.Pull  = GPIO_NOPULL;
+  g.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  HAL_GPIO_Init(TM_CLK_PORT, &g);
+
+  g.Pin   = TM_DIO_PIN;
+  g.Mode  = GPIO_MODE_OUTPUT_OD;
+  g.Pull  = GPIO_NOPULL;
+  g.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+  HAL_GPIO_Init(TM_DIO_PORT, &g);
+
+  tm1637SetBrightness(3);
 }
 
-void _tm1637Stop(void)
-{
-    _tm1637ClkLow();
-    _tm1637DelayUsec(2);
-    _tm1637DioLow();
-    _tm1637DelayUsec(2);
-    _tm1637ClkHigh();
-    _tm1637DelayUsec(2);
-    _tm1637DioHigh();
+void tm1637SetBrightness(int8_t level){
+  uint8_t cmd = 0x80;                       // display OFF
+  if(level >= 0){
+    if(level > 7) level = 7;
+    cmd = (uint8_t)(0x88 | (level & 7));    // display ON + brightness
+  }
+  start(); writeByte(cmd); stop_();
 }
 
-void _tm1637ReadResult(void)
-{
-    _tm1637ClkLow();
-    _tm1637DelayUsec(5);
-    // while (dio); // We're cheating here and not actually reading back the response.
-    _tm1637ClkHigh();
-    _tm1637DelayUsec(2);
-    _tm1637ClkLow();
-}
+void tm1637DisplayDecimal(int value, int showColon){
+  uint8_t d[4];
+  int v = value; if(v < 0) v = -v;
 
-void _tm1637WriteByte(unsigned char b)
-{
-    for (int i = 0; i < 8; ++i) {
-        _tm1637ClkLow();
-        if (b & 0x01) {
-            _tm1637DioHigh();
-        }
-        else {
-            _tm1637DioLow();
-        }
-        _tm1637DelayUsec(3);
-        b >>= 1;
-        _tm1637ClkHigh();
-        _tm1637DelayUsec(3);
-    }
-}
+  /* right-aligned, zero-padded */
+  for(int i=0;i<4;i++){ d[i] = SEG[v % 10]; v /= 10; }
+  if(showColon) d[1] |= 0x80;               // many modules use bit7 of digit1 for colon
 
-void _tm1637DelayUsec(unsigned int i)
-{
-    for (; i>0; i--) {
-        for (int j = 0; j < 10; ++j) {
-            __asm__ __volatile__("nop\n\t":::"memory");
-        }
-    }
-}
-//static inline void _tm1637DelayUsec(uint32_t us)
-//{
-//    uint32_t start = DWT->CYCCNT;
-//    uint32_t ticks = (SystemCoreClock / 1000000U) * us;
-//    while ((DWT->CYCCNT - start) < ticks) { /* spin */ }
-//}
-
-void _tm1637ClkHigh(void)
-{
-    HAL_GPIO_WritePin(CLK_PORT, CLK_PIN, GPIO_PIN_SET);
-}
-
-void _tm1637ClkLow(void)
-{
-    HAL_GPIO_WritePin(CLK_PORT, CLK_PIN, GPIO_PIN_RESET);
-}
-
-void _tm1637DioHigh(void)
-{
-    HAL_GPIO_WritePin(DIO_PORT, DIO_PIN, GPIO_PIN_SET);
-}
-
-void _tm1637DioLow(void)
-{
-    HAL_GPIO_WritePin(DIO_PORT, DIO_PIN, GPIO_PIN_RESET);
+  /* data cmd: auto-increment */
+  start(); writeByte(0x40); stop_();
+  /* address cmd: start at 0 */
+  start(); writeByte(0xC0);
+  /* send MS digit first */
+  writeByte(d[3]); writeByte(d[2]); writeByte(d[1]); writeByte(d[0]);
+  stop_();
 }
